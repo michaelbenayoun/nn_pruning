@@ -10,6 +10,7 @@ from torch.quantization import (
     DeQuantStub,
     FakeQuantize,
     MinMaxObserver,
+    MovingAverageMinMaxObserver
 )
 import transformers
 
@@ -27,7 +28,7 @@ _ATTENTION_MASK_INF = 20
 # For weights: int8 symmetric per-tensor [-127, 127] range
 _TFLITE_QAT_CONFIG = QConfig(
     activation=FakeQuantize.with_args(
-        observer=MinMaxObserver,
+        observer=MovingAverageMinMaxObserver,  # MinMaxObserver,
         dtype=torch.qint8,
         quant_min=-128,
         quant_max=127,
@@ -135,11 +136,11 @@ class QuantizedSoftmaxArray(nn.Module):
     def __init__(self, softmax, **kwargs) -> None:
         super().__init__()
         self.dim = softmax.dim
-        self.input_scale = self.softmax.quant_in.scale
-        self.input_zp = self.softmax.quant_in.zero_point
-        self.output_scale = self.softmax.quant_exp.scale
-        self.output_zp = self.softmax.quant_exp.zero_point
-        self.range = (self.softmax.quant_in.quant_min, self.sofmax.quant_in.quant_max)
+        self.input_scale = softmax.quant_in.scale
+        self.input_zp = softmax.quant_in.zero_point
+        self.output_scale = softmax.quant_exp.scale
+        self.output_zp = softmax.quant_exp.zero_point
+        self.range = (softmax.quant_in.quant_min, softmax.quant_in.quant_max)
 
         self.no_sum = hasattr(softmax, "sum_acc")
         if self.no_sum:
@@ -357,61 +358,11 @@ class QuantizedBertSelfAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        past_key_value=None,
-        output_attentions=False,
-    ):
-        # mixed_query_layer = self.query(hidden_states)
-
-        # # If this is instantiated as a cross-attention module, the keys
-        # # and values come from an encoder; the attention mask needs to be
-        # # such that the encoder"s padding tokens are not attended to.
-        # is_cross_attention = encoder_hidden_states is not None
-
-        # if is_cross_attention and past_key_value is not None:
-        #     # reuse k,v, cross_attentions
-        #     key_layer = past_key_value[0]
-        #     value_layer = past_key_value[1]
-        #     attention_mask = encoder_attention_mask
-        # elif is_cross_attention:
-        #     key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
-        #     value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
-        #     attention_mask = encoder_attention_mask
-        # elif past_key_value is not None:
-        #     key_layer = self.transpose_for_scores(self.key(hidden_states))
-        #     value_layer = self.transpose_for_scores(self.value(hidden_states))
-        #     key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
-        #     value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
-        # else:
-        #     key_layer = self.transpose_for_scores(self.key(hidden_states))
-        #     value_layer = self.transpose_for_scores(self.value(hidden_states))
-
-        # query_layer = self.transpose_for_scores(mixed_query_layer)
-
-        # if self.is_decoder:
-        #     # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
-        #     # Further calls to cross_attention layer can then reuse all cross-attention
-        #     # key/value_states (first "if" case)
-        #     # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
-        #     # all previous decoder key/value_states. Further calls to uni-directional self-attention
-        #     # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
-        #     # if encoder bi-directional self-attention `past_key_value` is always `None`
-        #     past_key_value = (key_layer, value_layer)
-
+    def compute_qkv(self, hidden_states):
         if self.use_separate_params:
-            query_layer = self.query(hidden_states)
-            key_layer = self.key(hidden_states)
-            value_layer = self.value(hidden_states)
-
-            query_layer = self.transpose_for_scores(query_layer)
-            key_layer = self.transpose_for_scores(key_layer)
-            value_layer = self.transpose_for_scores(value_layer)
+            query_layer = self.transpose_for_score(self.query(hidden_states))
+            key_layer = self.transpose_for_scores(self.key(hidden_states))
+            value_layer = self.transpose_for_scores(self.value(hidden_states))
         else:
             batch_size, seqlen, hidden_dim = hidden_states.shape
             projections = torch.addmm(
@@ -426,6 +377,55 @@ class QuantizedBertSelfAttention(nn.Module):
             query_layer = projections[0]
             key_layer = projections[1]
             value_layer = projections[2]
+        return query_layer, key_layer, value_layer
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        past_key_value=None,
+        output_attentions=False,
+    ):
+        # mixed_query_layer = self.query(hidden_states)
+
+        # If this is instantiated as a cross-attention module, the keys
+        # and values come from an encoder; the attention mask needs to be
+        # such that the encoder"s padding tokens are not attended to.
+        is_cross_attention = encoder_hidden_states is not None
+
+        if is_cross_attention and past_key_value is not None:
+            # reuse k,v, cross_attentions
+            query_layer = self.transpose_for_score(self.query(hidden_states))
+            key_layer = past_key_value[0]
+            value_layer = past_key_value[1]
+            attention_mask = encoder_attention_mask
+        elif is_cross_attention:
+            query_layer = self.transpose_for_score(self.query(hidden_states))
+            key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
+            value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
+            attention_mask = encoder_attention_mask
+        elif past_key_value is not None:
+            # query_layer = self.transpose_for_score(self.query(hidden_states))
+            # key_layer = self.transpose_for_scores(self.key(hidden_states))
+            # value_layer = self.transpose_for_scores(self.value(hidden_states))
+            query_layer, key_layer, value_layer = self.compute_qkv(hidden_states)
+            key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
+            value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
+        else:
+            query_layer, key_layer, value_layer = self.compute_qkv(hidden_states)
+
+        if self.is_decoder:
+            # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
+            # Further calls to cross_attention layer can then reuse all cross-attention
+            # key/value_states (first "if" case)
+            # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
+            # all previous decoder key/value_states. Further calls to uni-directional self-attention
+            # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
+            # if encoder bi-directional self-attention `past_key_value` is always `None`
+            past_key_value = (key_layer, value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
@@ -493,58 +493,185 @@ class QuantizedBertSelfAttention(nn.Module):
         return outputs
 
 
-# class QuantizedLayerNorm(nn.Module):
-#     def __init__(self, layer_norm, qconfig: QConfig = None, **kwargs) -> None:
-#         super().__init__()
-#         self.normalized_shape = layer_norm.normalized_shape
-#         self.eps = layer_norm.eps
-#         self.elementwise_affine = layer_norm.elementwise_affine
-#         if self.elementwise_affine:
-#             self.weight = nn.Parameter(layer_norm.weight.detach())
-#             self.bias = nn.Parameter(layer_norm.bias.detach())
-#         else:
-#             self.register_parameter("weight", None)
-#             self.register_parameter("bias", None)
-#
-#         # Quantization
-#         self.qconfig = qconfig
-#         if qconfig:
-#             self.quant1 = QuantStub(qconfig)
-#             self.quant2 = QuantStub(qconfig)
-#             self.weight_fake_quant = qconfig.weight()
-#             self.dequant = DeQuantStub()
-#
-#     def forward(self, input: torch.Tensor) -> torch.Tensor:
-#         # Implemented trying to mimic the TensorFlow BatchNorm implementation:
-#         # https://github.com/tensorflow/tensorflow/blob/85c8b2a817f95a3e979ecd1ed95bff1dc1335cff/tensorflow/python/ops/nn_impl.py
-#
-#         if self.qconfig:
-#             input = self.dequant(input)
-#
-#         mean = torch.mean(input, dim=-1, keepdim=True)
-#
-#         squared_diff = torch.pow(input - mean, 2)
-#
-#         # if self.qconfig:
-#         #     squared_diff = self.quant1(squared_diff)
-#
-#         var = torch.mean(squared_diff, dim=-1, keepdim=True)
-#
-#         if self.qconfig:
-#             var = self.quant1(var)
-#
-#         inv = torch.rsqrt(var + self.eps)
-#
-#         if self.weight is not None:
-#             inv = inv * self.weight_fake_quant(self.weight)
-#
-#         a = input * inv
-#
-#         q_mean = self.quant2(mean) if self.qconfig else mean
-#         # q_mean = mean
-#         b = self.bias - q_mean * inv if self.bias is not None else - q_mean * inv
-#
-#         return a + b
+class QuantizedGelu(nn.Module):
+    def __init__(self, qconfig: QConfig = None, **kwargs):
+        super().__init__()
+        self.qconfig = qconfig
+        if qconfig:
+            self.quant_mul = QuantStub(qconfig)
+            self.quant_erf = QuantStub(qconfig)
+            self.quant_mul_x = QuantStub(qconfig)
+            self.quant_out = QuantStub(qconfig)
+
+    def forward(self, x):
+
+        y = x / 1.4142135623730951
+
+        if self.qconfig:
+            y = self.quant_mul(y)
+
+        y = torch.erf(y)
+
+        if self.qconfig:
+            y = self.quant_erf(y)
+
+        y += 1.0
+
+        if self.qconfig:
+            x = self.quant_mul_x(0.5 * x)
+
+        res = x * y
+
+        if self.qconfig:
+            res = self.quant_out(res)
+
+        return res
+
+
+class QuantizedFastGelu(nn.Module):
+    def __init__(self, qconfig: QConfig = None, **kwargs):
+        super().__init__()
+
+        self.coeff1 = 0.044715
+        self.coeff2 = 0.7978845608
+
+        if qconfig:
+            self.quant_square = QuantStub(qconfig)
+            self.quant_coeff1 = QuantStub(qconfig)
+            self.quant_coeff2 = QuantStub(qconfig)
+            self.quant_mul3 = QuantStub(qconfig)
+            self.quant_prod = QuantStub(qconfig)
+            self.quant_tanh = QuantStub(qconfig)
+            self.quant_output = QuantStub(qconfig)
+
+   def forward(self, x):
+        # Initial computation:
+        # 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
+
+        square = x * x
+
+        if self.qconfig:
+            square = self.quant_square(square)
+
+        square = square * self.coeff1
+
+        if self.qconfig:
+            square = self.quant_coeff1(square)
+
+        square = square + 1
+
+        y = x * self.coeff2
+
+        if self.qconfig:
+            y = self.quant_coeff2(y)
+
+        prod = y * square
+
+        if self.qconfig:
+            prod = self.quant_prod(prod)
+
+        prod = torch.tanh(prod)
+
+        if self.qconfig:
+            prod = self.quant_tanh(prod)
+
+        prod = prod + 1
+
+        z = 0.5 * x
+
+        if self.qconfig:
+            z = self.quant_mul3(z)
+
+        output = z * prod
+
+        if self.qconfig:
+            output = self.quant_output(output)
+
+        return output
+
+
+class QuantizedLayerNorm(nn.Module):
+    def __init__(self, layer_norm, qconfig: QConfig = None, **kwargs) -> None:
+        super().__init__()
+        self.normalized_shape = layer_norm.normalized_shape
+        self.eps = layer_norm.eps
+        self.elementwise_affine = layer_norm.elementwise_affine
+        if self.elementwise_affine:
+            self.weight = nn.Parameter(layer_norm.weight.detach())
+            self.bias = nn.Parameter(layer_norm.bias.detach())
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+
+        # Quantization
+        self.qconfig = qconfig
+        if qconfig:
+            self.quant_squared_diff = QuantStub(qconfig)
+            self.quant_var = QuantStub(qconfig)
+            self.quant_inv = QuantStub(qconfig)
+            self.weight_fake_quant = qconfig.weight()
+            self.quant_a = QuantStub(qconfig)
+            self.quant_mean = QuantStub(qconfig)
+            self.quant_b = QuantStub(qconfig)
+            self.quant_out = QuantStub(qconfig)
+            self.dequant = DeQuantStub()
+            self.step = 0
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Implemented trying to mimic the TensorFlow BatchNorm implementation:
+        # https://github.com/tensorflow/tensorflow/blob/85c8b2a817f95a3e979ecd1ed95bff1dc1335cff/tensorflow/python/ops/nn_impl.py
+
+        if self.qconfig:
+            input = self.dequant(input)
+
+        mean = torch.mean(input, dim=-1, keepdim=True)
+
+        squared_diff = torch.pow(input - mean, 2)
+
+        # if self.qconfig:
+        #     if self.step < 100:
+        #         squared_diff = torch.clamp(squared_diff, max=1e9)
+        #         self.step += 1
+        #     q_squared_diff = self.quant_squared_diff(squared_diff)
+
+        # print((squared_diff - q_squared_diff).max()) #, (squared_diff - q_squared_diff).min())
+
+        var = torch.mean(squared_diff, dim=-1, keepdim=True)
+
+        if self.qconfig:
+            var = self.quant_var(var)
+
+        inv = torch.rsqrt(var + self.eps)
+
+        if self.qconfig:
+            # inv = torch.clamp(inv, min=self.eps, max=1/self.eps)
+            inv = self.quant_inv(inv)
+
+        if self.weight is not None:
+            weight = self.weight
+            if self.qconfig:
+                weight = self.weight_fake_quant(weight)
+            inv = inv * weight
+
+        a = input * inv
+
+        q_mean = mean
+
+        if self.qconfig:
+            a = self.quant_a(a)
+            q_mean = self.quant_mean(q_mean)
+
+        b = self.bias - q_mean * inv if self.bias is not None else - q_mean * inv
+
+        if self.qconfig:
+            b = self.quant_b(b)
+
+        res = a + b
+
+        if self.qconfig:
+            res = self.quant_out(res)
+
+        return res
 
 
 class QuantizedNoNorm(nn.Module):
