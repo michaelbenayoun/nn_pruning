@@ -8,93 +8,17 @@ from torch.quantization import (
 )
 from torch.quantization.quantize_fx import (
     convert_fx,
-    fuse_fx,
     prepare_fx,
     prepare_qat_fx,
 )
 from transformers.modeling_fx_utils import symbolic_trace
 
 from .quantization_config import create_qconfig
-
-
-def change_attention_mask_value(traced, initial_value=-10000, final_value=-20):
-    """Changes the attention mask initial value (default is -10000) to some smaller value."""
-    graph = traced.graph
-    for node in graph.nodes:
-        if node.target in [torch.mul, operator.mul] and initial_value in node.args:
-            new_args = []
-            for arg in node.args:
-                if arg == initial_value:
-                    new_args.append(final_value)
-                else:
-                    new_args.append(arg)
-            node.args = tuple(new_args)
-            break
-
-    graph.lint()
-    traced.recompile()
-    return traced
-
-
-def broadcast_attention_mask(traced):
-    """
-    Broadcasts attention_mask to match the shape of attention_scores as broadcasting is not
-    supported for quantized add.
-    """
-    graph = traced.graph
-    attention_mask = None
-    for node in graph.nodes:
-        if (
-            node.target in [torch.mul, torch.ops.quantized.mul, operator.mul]
-            and len(node.args) > 1
-            and node.args[1] < 0
-        ):
-            attention_mask = node
-            break
-    if attention_mask is None:
-        print("Could not find attention_mask to broadcast.")
-        return
-    for node in graph.nodes:
-        if node.target == torch.ops.quantized.add and attention_mask in node.args:
-            attention_scores, mask, *rest = node.args
-            with graph.inserting_before(node):
-                broadcasted_mask = graph.call_function(
-                    torch.broadcast_to, args=(mask, graph.call_method("size", args=(attention_scores,)))
-                )
-                new_args = []
-                for arg in node.args:
-                    if arg is mask:
-                        new_args.append(broadcasted_mask)
-                    else:
-                        new_args.append(arg)
-                node.args = tuple(new_args)
-    graph.lint()
-    traced.recompile()
-    return traced
-
-
-def broadcast_nonorm_bias(traced):
-    """
-    Broadcasts the NoNorm bias to match the shape of the scaled input as broadcasting is not
-    supported for quantized add.
-    """
-    graph = traced.graph
-    for node in graph.nodes:
-        if node.target == torch.ops.quantized.mul:
-            users = list(node.users.keys())
-            if len(users) == 1 and users[0].target == torch.ops.quantized.add:
-                add_node = users[0]
-                with graph.inserting_before(add_node):
-                    broadcasted_bias = graph.call_function(
-                        torch.broadcast_to,
-                        args=(add_node.args[1], graph.call_method("size", args=(add_node.args[0],))),
-                    )
-                    new_args = add_node.args[:1] + (broadcasted_bias,) + add_node.args[2:]
-                    add_node.args = tuple(new_args)
-
-    graph.lint()
-    traced.recompile()
-    return traced
+from .quantization_transformations import (
+    compose_transformations,
+    change_attention_mask_value,
+    change_truediv_to_mul_when_possible,
+)
 
 
 def _prepare(
@@ -106,6 +30,7 @@ def _prepare(
     sequence_length=128,
     num_choices=-1,
     qconfig_dict=None,
+    target=None,
 ):
     """Helper function that prepares the model for either static quantization or QAT."""
     if training:
@@ -117,9 +42,16 @@ def _prepare(
         model, input_names=input_names, batch_size=batch_size, sequence_length=sequence_length, num_choices=num_choices
     )
 
-    change_attention_mask_value(traced)
+    pre_prepare_transformation = compose_transformations(
+        change_attention_mask_value,
+        change_truediv_to_mul_when_possible,
+    )
+    pre_prepare_transformation(traced)
     prepare_custom_config_dict = {"preserved_attributes": ["config", "dummy_inputs"]}
     prepared_model = torch_prepare_fn(traced, qconfig_dict, prepare_custom_config_dict)
+
+    if target:
+        prepared_model = target.prepare(prepared_model, qconfig_dict=qconfig_dict)
 
     return prepared_model
 
@@ -132,13 +64,21 @@ def prepare_static(
     num_choices=-1,
     qconfig_name=None,
     qconfig_dict=None,
+    target=None,
 ):
     if qconfig_name and qconfig_dict:
         raise ValueError("either specify a qconfig name or a qconfig dict, but not both")
     if qconfig_name is None and qconfig_dict is None:
-        raise ValueError("a qconfig name or a qconfig dict need to be specified")
+        if target is None:
+            raise ValueError("a qconfig name, a qconfig dict or a target need to be specified")
+        else:
+            print(f"Using default qconfig dict for target {target.__name__}")
+            qconfig_dict = target.default_qconfig_dict()
     if qconfig_name:
         qconfig_dict = create_qconfig(qconfig_name, mode="static")
+
+    if target:
+        target.validate_qconfig_dict(qconfig_dict)
 
     return _prepare(
         model,
@@ -149,6 +89,7 @@ def prepare_static(
         sequence_length=sequence_length,
         num_choices=num_choices,
         qconfig_dict=qconfig_dict,
+        target=target,
     )
 
 
@@ -160,13 +101,21 @@ def prepare_qat(
     num_choices=-1,
     qconfig_name=None,
     qconfig_dict=None,
+    target=None,
 ):
     if qconfig_name and qconfig_dict:
         raise ValueError("either specify a qconfig name or a qconfig dict, but not both")
     if qconfig_name is None and qconfig_dict is None:
-        raise ValueError("a qconfig name or a qconfig dict need to be specified")
+        if target is None:
+            raise ValueError("a qconfig name, a qconfig dict or a target need to be specified")
+        else:
+            print(f"Using default qconfig dict for target {target.__name__}")
+            qconfig_dict = target.default_qat_qconfig_dict()
     if qconfig_name:
         qconfig_dict = create_qconfig(qconfig_name, mode="qat")
+
+    if target:
+        target.validate_qat_qconfig_dict(qconfig_dict)
 
     return _prepare(
         model,
@@ -177,6 +126,7 @@ def prepare_qat(
         sequence_length=sequence_length,
         num_choices=num_choices,
         qconfig_dict=qconfig_dict,
+        target=target,
     )
 
 

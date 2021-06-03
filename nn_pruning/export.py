@@ -14,7 +14,7 @@ import onnxruntime.quantization.quant_utils as ort_quant_utils
 from transformers import AutoConfig, MODEL_MAPPING
 
 from .inference_model_patcher import optimize_model
-from .modules.graph_mode_quantization import prepare_for_qat
+from .modules.quantization import prepare_qat
 
 _DEFAULT_OPSET_VERSION = 13
 _AVAILABLE_TARGETS = {"onnx"}
@@ -302,7 +302,7 @@ def export_model_for_inference(
 
     if sparse_args["qat"]:
         qconfig_name = sparse_args["qconfig"]
-        prepare_for_qat(model, qconfig_name=qconfig_name)
+        prepare_qat(model, qconfig_name=qconfig_name)
         model.load_state_dict(model_dir.joinpath("pytorch_model.bin"), strict=False)
 
     if quantization == "dynmic" and sparse_args["qat"]:
