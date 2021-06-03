@@ -44,7 +44,7 @@ def _prepare(
 
     pre_prepare_transformation = compose_transformations(
         change_attention_mask_value,
-        change_truediv_to_mul_when_possible,
+        # change_truediv_to_mul_when_possible,
     )
     pre_prepare_transformation(traced)
     prepare_custom_config_dict = {"preserved_attributes": ["config", "dummy_inputs"]}

@@ -79,14 +79,15 @@ def _insert_identity_node_if_output_is_fakequantize(graph):
             # graph.output.pop()
             # graph.output.append(output_value_info)
 
+
 def _prepare_qat_model_for_onnx(model):
 
     """
-        Prepares a model with FakeQuantization nodes for the export to a quantized version in the
-        ONNX format.
-        To do that, the fake quantization nodes are disabled for the weights (as it is already
-        handled by ONNX), and the all the observers are disabled as ONNX traces the model (and thus
-        performs a forward pass) for the export.
+    Prepares a model with FakeQuantization nodes for the export to a quantized version in the
+    ONNX format.
+    To do that, the fake quantization nodes are disabled for the weights (as it is already
+    handled by ONNX), and the all the observers are disabled as ONNX traces the model (and thus
+    performs a forward pass) for the export.
     """
     to_visit = [('', model, None)]
     while to_visit:

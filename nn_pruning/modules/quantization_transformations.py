@@ -21,6 +21,33 @@ def _add_fake_quant_to_module(module, fake_quant_name, qconfig, device=None):
     register_activation_post_process_hook(stub)
 
 
+def _remove_nodes_matching_pattern_in_range(gm, start, end, patterns, named_modules, lint_and_recompile=True):
+    graph = gm.graph
+    n = start
+    nodes_to_erase = []
+    while n != end:
+        if _match(n, patterns, named_modules):
+            input_nodes = [arg for arg in n.args if isinstance(arg, torch.fx.Node)]
+            if len(input_nodes) != 1:
+                # TODO: choose the right kind of error.
+                raise RuntimeError("cannot remove node that does not have exactly one input node")
+            input_node = input_nodes[0]
+            n.replace_all_uses_with(input_node)
+            # print(named_modules[n.target])
+            # print(named_modules[input_node.target])
+            graph.erase_node(n)
+            nodes_to_erase.append(n)
+        n = n.next
+
+    # for node in nodes_to_erase:
+    #     graph.erase_node(node)
+
+    if lint_and_recompile:
+        graph.lint()
+        gm.recompile()
+    return gm
+
+
 def change_truediv_to_mul_when_possible(gm: GraphModule):
     """Transforms truediv nodes by multiplication of the inverse when the denominator is static."""
     graph = gm.graph
@@ -145,6 +172,73 @@ def append_noop_node_to_fake_quantize_nodes_before_output(gm: GraphModule) -> Gr
     return gm
 
 
+def remove_fake_quantize_nodes_from_attention(gm: GraphModule) -> GraphModule:
+    # TODO: write proper attention_pattern (the one with linears)
+    attention_pattern = [
+        torch.nn.Linear,
+        torch.nn.Linear,
+        "view",
+        "permute",
+        torch.nn.Linear,
+        "view",
+        "permute",
+        "view",
+        "permute",
+        "transpose",
+        torch.matmul,
+        # Both cases are valid because change_truediv_to_mul_when_possible transformation can be
+        # applied.
+        (operator.mul, operator.truediv),
+        operator.add,
+        torch.nn.Softmax,
+        torch.matmul,
+        "permute",
+        "contiguous",
+        "view",
+    ]
+    attention_with_decomposed_linears_pattern = [
+        torch.matmul,
+        torch.add,
+        torch.matmul,
+        torch.add,
+        "view",
+        "permute",
+        torch.matmul,
+        torch.add,
+        "view",
+        "permute",
+        "view",
+        "permute",
+        "transpose",
+        torch.matmul,
+        # Both cases are valid because change_truediv_to_mul_when_possible transformation can be
+        # applied.
+        (operator.mul, operator.truediv),
+        operator.add,
+        torch.nn.Softmax,
+        torch.matmul,
+        "permute",
+        "contiguous",
+        "view",
+    ]
+    ignore_pattern = [QuantStub, FakeQuantize, torch.nn.Dropout]
+    matches = match_pattern(gm, attention_pattern, ignore=ignore_pattern)
+    if not matches:
+        matches = match_pattern(gm, attention_with_decomposed_linears_pattern, ignore=ignore_pattern)
+
+    named_modules = dict(gm.named_modules())
+    pattern = [QuantStub, FakeQuantize]
+    for (start, end) in matches:
+        _remove_nodes_matching_pattern_in_range(
+            gm, start, end, pattern, named_modules, lint_and_recompile=False
+        )
+
+    gm.graph.lint()
+    gm.recompile()
+
+    return gm
+
+
 def change_attention_mask_value(gm: GraphModule, initial_value: int = -10000, final_value: int = -20) -> GraphModule:
     """Changes the attention mask initial value (default is -10000) to some smaller value."""
     graph = gm.graph
@@ -223,6 +317,55 @@ def broadcast_nonorm_bias(gm: GraphModule) -> GraphModule:
     graph.lint()
     gm.recompile()
     return gm
+
+
+def _match(node, node_patterns, named_modules):
+    if not isinstance(node_patterns, (list, tuple)):
+        node_patterns = [node_patterns]
+    return any(
+        any((
+            callable(pattern) and node.op == "call_function" and node.target == pattern,
+            isinstance(pattern, str) and node.op == "call_method" and node.target == pattern,
+            isinstance(pattern, type) and node.op == "call_module" and isinstance(named_modules[node.target], pattern),
+        ))
+        for pattern in node_patterns
+    )
+
+
+def match_pattern(gm, pattern, ignore=None):
+    if ignore is None:
+        ignore = []
+    graph = gm.graph
+    named_modules = dict(gm.named_modules())
+    num_nodes_in_pattern = len(pattern)
+    matches = []
+    for node in graph.nodes:
+        idx = 0
+        n = node
+        is_a_match = True
+        while idx < num_nodes_in_pattern:
+            p = pattern[idx]
+            if n.op not in ["call_function", "call_method", "call_module"] or _match(n, ignore, named_modules):
+                if n.next:
+                    n = n.next
+                    continue
+                else:
+                    break
+            if _match(n, p, named_modules):
+                if n.next:
+                    idx += 1
+                    n = n.next
+                    continue
+                else:
+                    break
+            else:
+                is_a_match = False
+                break
+
+        if is_a_match and idx == num_nodes_in_pattern:
+            matches.append((node, n))
+
+    return matches
 
 
 def compose_transformations(*args: Callable[[GraphModule], GraphModule]) -> GraphModule:
