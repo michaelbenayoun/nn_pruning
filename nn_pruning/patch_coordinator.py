@@ -41,6 +41,8 @@ from .modules.nonorm import Layer2NoNorm, NoNorm, NoNormCompiler, Layer2NoNormPa
 from .modules.gelu2relu import GeLU2ReLUModelPatcher
 from .inference_model_patcher import BertHeadsPruner
 
+from .modules.quantization import prepare_qat
+
 from nn_pruning.training_patcher import (
     LinearModelPatcher,
     PatcherContext,
@@ -744,6 +746,15 @@ class ModelPatchingCoordinator:
             gelu_patcher = GeLU2ReLUModelPatcher(schedule_callback=schedule_callback)
             gelu_patcher.patch(model)
             self.stats["gelu"] = gelu_patcher.stats
+
+        if sparse_args.qat:
+            model = prepare_qat(
+                model,
+                input_names=["input_ids", "attention_mask", "token_type_ids"],
+                batch_size=16,
+                sequence_length=384,
+                qconfig_name=sparse_args.qconfig,
+            )
 
         return patcher
 
