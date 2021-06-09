@@ -141,6 +141,11 @@ class SparseGlueShortNamer(TrialShortNamer):
         'rewind_model_name_or_path': None,
         'qat': False,
         'qconfig': 'default',
+        'length_column_name': 'length',
+        'mp_parameters': '',
+        'use_legacy_prediction_loop': False,
+        'push_to_hub': False,
+        'log_on_each_node': True
     }
 
 

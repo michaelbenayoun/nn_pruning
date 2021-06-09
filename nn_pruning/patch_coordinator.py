@@ -39,6 +39,7 @@ from .modules.masked_nn import (
 )
 from .modules.nonorm import Layer2NoNorm, NoNorm, NoNormCompiler, Layer2NoNormPatcher
 from .modules.gelu2relu import GeLU2ReLUModelPatcher
+from .modules.quantization import prepare_qat
 from .inference_model_patcher import BertHeadsPruner
 
 from nn_pruning.training_patcher import (
@@ -257,6 +258,11 @@ class SparseTrainingArguments:
     qconfig: str = field(
         default="default",
         metadata={"help": "The quantization scheme configuration to use for QAT"},
+    )
+
+    target: str = field(
+        default=None,
+        metadata={"help": "The target inference engine, providing this allows to perform the proper optimizations for the specified target."},
     )
 
     @classmethod
@@ -613,7 +619,6 @@ class ModelPatchingCoordinator:
 
 
     def patch_model(self, model, trial = None):
-        layers_count = model.config.num_hidden_layers
         sparse_args = self.sparse_args
 
         device = model.device
@@ -745,7 +750,19 @@ class ModelPatchingCoordinator:
             gelu_patcher.patch(model)
             self.stats["gelu"] = gelu_patcher.stats
 
-        return patcher
+        if sparse_args.qat:
+            prepared = prepare_qat(
+                model,
+                input_names=["input_ids", "attention_mask", "token_type_ids", "start_positions", "end_positions", "labels"],
+                batch_size=16,
+                sequence_length=128,
+                qconfig_name=sparse_args.qconfig,
+                target=sparse_args.target
+            )
+
+            model = prepared
+
+        return model
 
 
     def compile_model(self, model):

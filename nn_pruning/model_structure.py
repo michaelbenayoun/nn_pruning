@@ -122,6 +122,7 @@ config2struct = {
 
 name2struct = {
     "bert": BertStructure,
+    "distilbert": BertStructure,
     "bart": BartStructure,
     "t5": T5Structure,
 }
@@ -174,4 +175,3 @@ def count_num_heads(model):
                     raise RuntimeError(f"Not able to retrieve number of attention head")
                 head_count += num_attention_heads
     return head_count
-

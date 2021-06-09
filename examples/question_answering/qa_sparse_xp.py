@@ -148,6 +148,10 @@ class SparseQAShortNamer(TrialShortNamer):
         'mp_parameters': '',
         'qat': False,
         'qconfig': 'default',
+        'use_legacy_prediction_loop': False,
+        'push_to_hub': False,
+        'log_on_each_node': True
+
     }
 
 
@@ -211,7 +215,3 @@ class QASparseXP(SparseXP, QAXP):
         qa.run()
 
         cls.fix_last_checkpoint_bug(dest_path)
-
-
-
-

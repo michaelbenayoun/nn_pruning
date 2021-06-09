@@ -54,7 +54,8 @@ class SparseXP:
             model = self.unzero_parameters(model)
         else:
             model = super().model_init(trial)
-            self.patch_coordinator.patch_model(model, trial)
+            model = self.patch_coordinator.patch_model(model, trial)
+            import pdb; pdb.set_trace()
         return model
 
     @classmethod
