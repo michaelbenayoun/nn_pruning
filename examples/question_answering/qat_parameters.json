@@ -1,6 +1,6 @@
 {
-  "model_name_or_path": "distilbert-base-uncased-distilled-squad",
-  "dataset_name": "squad",
+  "model_name_or_path": "bert-base-uncased",
+  "dataset_name": "sst2",
   "do_train": 1,
   "do_eval": 1,
   "per_device_train_batch_size": 16,
