@@ -18,6 +18,8 @@ from .quantization_transformations import (
     compose_transformations,
     change_attention_mask_value,
     change_truediv_to_mul_when_possible,
+    broadcast_attention_mask,
+    broadcast_nonorm_bias
 )
 
 
