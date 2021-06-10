@@ -754,8 +754,8 @@ class ModelPatchingCoordinator:
             prepared = prepare_qat(
                 model,
                 input_names=["input_ids", "attention_mask", "token_type_ids", "start_positions", "end_positions", "labels"],
-                batch_size=16,
-                sequence_length=128,
+                # batch_size=16,
+                # sequence_length=128,
                 qconfig_name=sparse_args.qconfig,
                 target=sparse_args.target
             )
@@ -763,7 +763,6 @@ class ModelPatchingCoordinator:
             model = prepared
 
         return model
-
 
     def compile_model(self, model):
         self.schedule_threshold(compile=True)
