@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Optional
 import timeit
 
+from torch.fx import GraphModule
+
 import transformers
 from transformers import (
     AutoConfig,
@@ -22,6 +24,8 @@ from transformers.trainer import Trainer
 from transformers.trainer_utils import (
     PREFIX_CHECKPOINT_DIR,
 )
+from transformers.modeling_fx_utils import make_inference_version
+
 from nn_pruning.sparse_trainer import TimingModule
 from transformers.trainer_utils import (
     HPSearchBackend,
@@ -457,3 +461,22 @@ class XPTrainer(Trainer):
                 s = json.dumps(v.__dict__, indent=4, sort_keys=True)
                 with open(os.path.join(checkpoint_dir, filename), "w") as f:
                     f.write(s)
+
+    def predict(self, test_dataset, ignore_keys=None, metric_key_prefix: str = "test"):
+        contains_labels = "label" in test_dataset.features.keys() \
+            and all(example["label"] > 0 for example in test_dataset)
+        contains_start_and_end_positions = "start_positions" in test_dataset.features.keys() and \
+            "end_positions" in test_dataset.features.keys() and \
+            all(example["start_positions"] > 0 and example["end_positions"] > 0 for example in test_dataset)
+
+        model_backup = None
+        if not (contains_labels or contains_start_and_end_positions) and isinstance(self.model, GraphModule):
+            model_backup = self.model
+            self.model = make_inference_version(self.model)
+
+        res = super().predict(test_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+
+        if model_backup is not None:
+            self.model = model_backup
+
+        return res

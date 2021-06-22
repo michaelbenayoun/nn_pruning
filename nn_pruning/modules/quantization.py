@@ -83,9 +83,6 @@ def _prepare(
 
     batch_size, sequence_length = _generate_random_input_shape(model)
 
-    # batch_size = 16
-    # sequence_length=128
-
     traced = symbolic_trace(
         model, input_names=input_names, batch_size=batch_size, sequence_length=sequence_length, num_choices=num_choices
     )
